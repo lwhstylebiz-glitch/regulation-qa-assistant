@@ -101,6 +101,66 @@ def generate_answer(client, gen_model, question, retrieved):
     return resp["message"]["content"]
 
 
+# 업로드한 문서에 맞지 않을 때 쓰는 기본 예시 질문
+FALLBACK_EXAMPLES = [
+    "이 규정의 핵심 내용은 무엇인가요?",
+    "가장 중요한 조항은 무엇인가요?",
+]
+
+EXAMPLE_GEN_PROMPT = """너는 규정 문서를 보고 직원이 실제로 궁금해할 질문을 만드는 역할이다.
+아래는 한 규정 문서에서 뽑은 조항 제목 목록이다.
+이 목록에 담긴 내용만 근거로, 직원이 실제로 물어볼 법한 자연스러운 질문 4개를 만들어라.
+규칙:
+- 반드시 목록에 있는 내용에 근거한 질문만 만든다. 목록에 없는 주제는 만들지 않는다.
+- 한 줄에 질문 하나씩, 번호·기호·따옴표 없이 질문 문장만 출력한다.
+- 간결한 한국어 존댓말로, 물음표로 끝낸다."""
+
+
+def collect_article_titles(chunks, limit=30):
+    """각 조항의 첫 줄(제목)을 중복 없이 모은다."""
+    titles = []
+    seen = set()
+    for c in chunks:
+        first_line = c["text"].splitlines()[0].strip() if c["text"] else ""
+        if not first_line or first_line in seen:
+            continue
+        seen.add(first_line)
+        titles.append(first_line)
+        if len(titles) >= limit:
+            break
+    return titles
+
+
+def clean_question(line):
+    """LLM 출력 한 줄에서 번호·기호·따옴표를 제거한다."""
+    line = line.strip()
+    line = re.sub(r'^\s*(?:\d+[.)]|[-*•])\s*', '', line)  # 앞 번호/불릿 제거
+    return line.strip().strip('"\'')
+
+
+def generate_example_questions(client, gen_model, chunks):
+    """업로드한 문서 내용에 맞는 예시 질문 4개를 LLM으로 생성한다."""
+    titles = collect_article_titles(chunks)
+    if not titles:
+        return FALLBACK_EXAMPLES
+    title_block = "\n".join(f"- {t}" for t in titles)
+    try:
+        resp = client.chat(
+            model=gen_model,
+            messages=[
+                {"role": "system", "content": EXAMPLE_GEN_PROMPT},
+                {"role": "user", "content": f"[조항 제목 목록]\n{title_block}"},
+            ],
+            options={"temperature": 0.4, "num_ctx": 8192, "num_predict": 256},
+        )
+        content = resp["message"]["content"]
+    except Exception:
+        return FALLBACK_EXAMPLES
+    questions = [clean_question(l) for l in content.splitlines()]
+    questions = [q for q in questions if q.endswith("?") and len(q) >= 6]
+    return questions[:4] if questions else FALLBACK_EXAMPLES
+
+
 st.title("📘 규정 Q&A 도우미 (로컬 / 완전 오프라인)")
 st.caption("규정 PDF를 올리면 근거 조항과 함께 답해줍니다. 모든 처리가 로컬에서 실행돼 외부 전송이 없습니다.")
 
@@ -116,7 +176,7 @@ with st.sidebar:
         st.session_state.history = []
         st.rerun()
     if st.button("🔄 인덱스 초기화 (PDF 다시 올리기)", use_container_width=True):
-        for k in ("chunks", "matrix", "filename"):
+        for k in ("chunks", "matrix", "filename", "examples"):
             st.session_state.pop(k, None)
         st.session_state.history = []
         st.rerun()
@@ -152,15 +212,11 @@ if uploaded and st.session_state.get("filename") != uploaded.name:
         st.session_state.chunks = chunks
         st.session_state.matrix = matrix
         st.session_state.filename = uploaded.name
+        with st.spinner("문서에 맞는 예시 질문 생성 중..."):
+            st.session_state.examples = generate_example_questions(
+                client, gen_model, chunks
+            )
     st.success(f"인덱싱 완료 — {len(chunks)}개 조항/청크 ({uploaded.name})")
-
-
-EXAMPLE_QUESTIONS = [
-    "연차휴가는 며칠까지 쓸 수 있나요?",
-    "근무시간과 휴게시간은 어떻게 되나요?",
-    "출장 여비는 어떻게 신청하나요?",
-    "징계의 종류와 절차는 어떻게 되나요?",
-]
 
 
 def answer_question(client, gen_model, question):
@@ -191,10 +247,11 @@ def render_sources(sources):
 
 if "chunks" in st.session_state:
     st.divider()
-    st.markdown("**💡 예시 질문 (클릭해서 바로 질문)**")
+    st.markdown("**💡 이 문서에 대한 예시 질문 (클릭해서 바로 질문)**")
     clicked = None
+    examples = st.session_state.get("examples", FALLBACK_EXAMPLES)
     cols = st.columns(2)
-    for idx, ex in enumerate(EXAMPLE_QUESTIONS):
+    for idx, ex in enumerate(examples):
         if cols[idx % 2].button(ex, key=f"ex_{idx}", use_container_width=True):
             clicked = ex
     st.divider()
