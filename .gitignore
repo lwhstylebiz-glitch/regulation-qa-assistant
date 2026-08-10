@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# 가상환경
+venv/
+.venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# 임베딩 캐시 / 데이터
+*.npy
+
+# 데모용 PDF (필요하면 이 줄을 지우고 커밋하세요)
+*.pdf
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
