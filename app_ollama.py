@@ -15,13 +15,15 @@ LLM과 임베딩을 모두 '개인 PC 안에서' 실행. 데이터가 외부로 
 - 앱 시작 시 모델 예열, 답변 스트리밍, 응답 시간·근거 일치도 표시
 - 이어서 질문하기: 앞 대화를 기억해 후속 질문에 답함
 - 근거를 못 찾으면 지어내지 않고 안내
-- 사이드바: 상태 표시, 모델 선택, 조항 직접 보기, 대화 내용 저장
+- 상단 바: 답변 모델 선택, 상태 표시, 문서·응답 시간, ⚙️ 설정(기준값·PDF 올리기·대화 저장)
+- 사이드바: 조항 보기 (출처의 '전체 보기'로 바로 이동)
 
 [ 실행 ]
 python -m streamlit run app_ollama.py
 """
 
 import hashlib
+import html
 import io
 import itertools
 import pickle
@@ -69,6 +71,11 @@ NO_GROUNDS_MSG = ("해당 내용은 규정에서 확인할 수 없습니다. "
                   "질문과 관련된 조항을 찾지 못했어요. 규정에 있는 내용으로 다시 질문해 주세요.")
 
 st.set_page_config(page_title="규정 도우미", page_icon="🔒", layout="wide")
+# 사이드바(조항 보기)를 넓혀 원문을 읽기 편하게 함. 접으면 그대로 접힘.
+st.markdown("""<style>
+section[data-testid="stSidebar"][aria-expanded="true"],
+section[data-testid="stSidebar"][data-collapsed="false"] { min-width: 420px; }
+</style>""", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
@@ -177,9 +184,8 @@ def article_index_of(chunk_id):
 
 
 def goto_article(idx):
-    """'전체 보기' 버튼: 사이드바 조항 보기를 해당 조항으로 이동시키고 펼침."""
+    """'전체 보기' 버튼: 사이드바 조항 보기를 해당 조항으로 이동."""
     st.session_state.article_pick = idx
-    st.session_state.article_open = True
     st.session_state.goto_toast = st.session_state.articles[idx][0]
 
 
@@ -318,12 +324,20 @@ FOLLOWUP_CUES = ("그럼", "그러면", "그런데", "근데", "그리고", "그
                  "그 경우", "이 경우", "그때", "그 때", "이건", "이거", "만약", "혹시", "또 ", "그렇다면")
 
 
+# 짧게 이어 묻는 말투로 끝나는 질문. 예) "3년이면?", "육아휴직은요?", "결혼하면요?"
+FOLLOWUP_END = re.compile(r"(은요|는요|이요|면요|이면|라면|하면|되면|건요|거요)\s*\??\s*$")
+
+
 def is_followup(question, history):
-    """앞 대화에 이어지는 질문인지 판단: 이어주는 말로 시작하거나 아주 짧은 질문."""
+    """앞 대화에 이어지는 질문인지 판단.
+    - "그럼", "그 경우" 같은 이어주는 말로 시작하거나
+    - 짧으면서 이어 묻는 말투로 끝나는 질문
+    ("오늘 날씨 어때?"처럼 짧기만 한 엉뚱한 질문은 해당 안 됨)"""
     if not history:
         return False
     q = question.strip()
-    return q.startswith(FOLLOWUP_CUES) or len(q.replace(" ", "")) <= 8
+    short = len(q.replace(" ", "")) <= 12
+    return q.startswith(FOLLOWUP_CUES) or (short and bool(FOLLOWUP_END.search(q)))
 
 
 # ── 표현 사전: 직원이 쓰는 말 → 규정에 적힌 말 (검색할 때 같이 찾음) ──
@@ -569,7 +583,7 @@ def _source_block(s, key):
     idx = article_index_of(s.get("chunk"))
     if idx is not None:
         btn.button("📚 전체 보기", key=key, on_click=goto_article, args=(idx,),
-                   help="왼쪽 '조항 직접 보기'에서 이 조항 원문 전체를 엽니다.")
+                   help="왼쪽 '조항 보기'에서 이 조항 원문 전체를 엽니다.")
     st.text(s["text"][:600] + ("..." if len(s["text"]) > 600 else ""))
 
 
@@ -632,88 +646,109 @@ st.caption("규정 PDF를 자연어로 질문하면, 근거 조항과 함께 답
 client = get_client()
 connected, installed = list_models(client)
 
-# --- 사이드바 ---
-with st.sidebar:
-    st.header("설정")
+# --- 상단 바: 답변 모델 · 상태 · 문서 정보 · 설정 (한 줄로 작게) ---
+with st.container(border=True):
+    col_model, col_status, col_q, col_set = st.columns([1.8, 3.8, 1.6, 1.2], vertical_alignment="center")
 
     # 답변 모델 선택 (설치된 모델 중에서)
     gen_options = [n for n in installed if not n.startswith(EMBED_MODEL)]
-    if gen_options:
-        default_idx = gen_options.index(DEFAULT_GEN_MODEL) if DEFAULT_GEN_MODEL in gen_options else 0
-        gen_model = st.selectbox("답변 모델", gen_options, index=default_idx,
-                                 help="Ollama에 설치된 모델 중에서 고릅니다.")
-    else:
-        gen_model = DEFAULT_GEN_MODEL
+    with col_model:
+        if gen_options:
+            default_idx = gen_options.index(DEFAULT_GEN_MODEL) if DEFAULT_GEN_MODEL in gen_options else 0
+            gen_model = st.selectbox("답변 모델", gen_options, index=default_idx, key="gen_model",
+                                     label_visibility="collapsed",
+                                     help="답변 모델: Ollama에 설치된 모델 중에서 고릅니다.")
+        else:
+            gen_model = DEFAULT_GEN_MODEL
+            st.markdown(f"답변 모델: `{gen_model}`")
 
-    # 상태 표시
-    st.subheader("상태")
+    # 상태 (한 줄) + 문서 정보·응답 시간 (한 줄)
     has_embed = _full_name(EMBED_MODEL) in installed
     has_gen = _full_name(gen_model) in installed
-    st.markdown(f"{'✅' if connected else '❌'} Ollama 연결")
-    st.markdown(f"{'✅' if has_embed else '❌'} 임베딩 모델 ({EMBED_MODEL})")
-    st.markdown(f"{'✅' if has_gen else '❌'} 답변 모델 ({gen_model})")
     ready = connected and has_embed and has_gen
+    ok = lambda b: "✅" if b else "❌"
+    with col_status:
+        warm = ""
+        if ready:
+            try:
+                with st.spinner("모델 예열 중... (처음 한 번만)"):
+                    warm_up(gen_model)
+                warm = " · ✅ 예열"
+            except Exception:
+                warm = " · ⚠️ 예열 실패"
+        st.markdown(f"{ok(connected)} Ollama · {ok(has_embed)} {EMBED_MODEL} · {ok(has_gen)} {gen_model}{warm}")
+        info = []
+        if "doc_name" in st.session_state:
+            info.append(f"📄 {st.session_state.doc_name} ({len(st.session_state.articles)}개 조항)")
+        answered = [h for h in st.session_state.history if h["grounded"]]
+        if answered:
+            avg = sum(h["timing"]["total"] for h in answered) / len(answered)
+            info.append(f"⏱ 질문 {len(answered)}건 · 평균 {avg:.1f}초")
+        if info:
+            st.caption("  |  ".join(info))
 
-    if ready:
-        try:
-            with st.spinner("모델 예열 중... (처음 한 번만)"):
-                warm_up(gen_model)
-            st.markdown("✅ 모델 예열 완료")
-        except Exception as e:
-            st.markdown(f"⚠️ 예열 실패: {e}")
-    elif not connected:
-        st.error("Ollama가 실행 중이 아닙니다. 작업표시줄 라마 아이콘을 확인하세요.")
-    else:
-        missing = [n for n, ok in ((EMBED_MODEL, has_embed), (gen_model, has_gen)) if not ok]
-        st.warning("모델을 먼저 받으세요:\n" + "\n".join(f"`ollama pull {n}`" for n in missing))
+    # 내 질문: 지금까지 한 질문 목록 → 누르면 그 답변 위치로 이동
+    with col_q:
+        hist = st.session_state.history
+        with st.popover(f"📝 내 질문 {len(hist)}", use_container_width=True):
+            if not hist:
+                st.caption("아직 한 질문이 없어요.")
+            else:
+                st.caption("질문을 누르면 그 답변으로 이동해요. 최근 질문이 위에 있어요.\n다 봤으면 빈 곳을 클릭해서 닫으세요.")
+                with st.container(height=min(60 + 56 * len(hist), 420), border=False):
+                    for n in range(len(hist) - 1, -1, -1):
+                        h = hist[n]
+                        q = h["q"] if len(h["q"]) <= 40 else h["q"][:40] + "…"
+                        mark = "💬" if h["grounded"] else "⚠️"
+                        refs = ", ".join(dict.fromkeys(
+                            s["label"] for s in h["sources"] if s["article"] in cited_articles(h["answer"])
+                        )) if h["grounded"] else "관련 조항 없음"
+                        st.markdown(
+                            f'{mark} <a href="#q{n + 1}" target="_self">Q{n + 1}. {html.escape(q)}</a>'
+                            f'<br><span style="font-size:0.8em;color:gray">{html.escape(refs)}</span>',
+                            unsafe_allow_html=True)
 
-    # 문서
-    st.subheader("문서")
-    uploaded = st.file_uploader("규정 PDF 업로드", type=["pdf"])
+    # 설정: 누르면 작은 창이 열림
+    with col_set:
+        with st.popover("⚙️ 설정", use_container_width=True):
+            min_score = st.slider(
+                "근거 판단 기준 (관련도)", 0.0, 1.0, DEFAULT_MIN_SCORE, 0.01,
+                help="가장 관련 높은 조항의 관련도가 이 값보다 낮으면, 답을 지어내지 않고 '규정에서 확인할 수 없음'으로 안내합니다.",
+            )
+            uploaded = st.file_uploader("다른 규정 PDF 올리기", type=["pdf"])
+            if st.session_state.history:
+                st.download_button(
+                    "💾 대화 내용 저장", export_text(st.session_state.history, st.session_state.get("doc_name", "")),
+                    file_name=f"규정도우미_대화_{datetime.now():%Y%m%d_%H%M}.txt",
+                    mime="text/plain", use_container_width=True,
+                )
+            if st.button("🧹 대화 기록 지우기", use_container_width=True):
+                st.session_state.history = []
+                st.rerun()
+
+# 준비가 안 됐을 때만 안내 표시
+if not connected:
+    st.error("Ollama가 실행 중이 아닙니다. 작업표시줄 라마 아이콘을 확인하세요.")
+elif not ready:
+    missing = [n for n, b in ((EMBED_MODEL, has_embed), (gen_model, has_gen)) if not b]
+    st.warning("모델을 먼저 받으세요:\n" + "\n".join(f"`ollama pull {n}`" for n in missing))
+
+# --- 사이드바: 조항 보기 전용 ---
+with st.sidebar:
+    st.header("📚 조항 보기")
     if "doc_name" in st.session_state:
-        st.markdown(f"📄 **{st.session_state.doc_name}**")
-        st.caption(f"{len(st.session_state.articles)}개 조항 · 분석 {st.session_state.index_sec:.1f}초")
-
-        # 조항 직접 보기 ('전체 보기' 버튼으로 이동해 오면 자동으로 펼쳐짐)
         arts = st.session_state.articles
         if st.session_state.get("article_pick", 0) >= len(arts):
             st.session_state.article_pick = 0
-        opened = st.session_state.get("article_open", False)
-        cur = arts[st.session_state.get("article_pick", 0)][0]
-        # 제목에 현재 조항을 넣어, 다른 조항으로 이동하면 새로 펼쳐지도록 함
-        with st.expander(f"📚 조항 직접 보기 · {cur}" if opened else "📚 조항 직접 보기", expanded=opened):
-            pick = st.selectbox("조항 선택", range(len(arts)),
-                                format_func=lambda i: arts[i][0], key="article_pick")
-            label, page, body, _ = arts[pick]
-            st.caption(f"p.{page}")
-            with st.container(height=320):
-                st.text(body)
-
-    # 응답 시간 통계 (발표 실측용)
-    answered = [h for h in st.session_state.history if h["grounded"]]
-    if answered:
-        st.subheader("응답 시간")
-        c1, c2 = st.columns(2)
-        c1.metric("질문 수", f"{len(answered)}건")
-        c2.metric("평균", f"{sum(h['timing']['total'] for h in answered) / len(answered):.1f}초")
-
-    # 고급 설정: 근거 판단 기준
-    with st.expander("⚙️ 고급 설정"):
-        min_score = st.slider(
-            "근거 판단 기준 (관련도)", 0.0, 1.0, DEFAULT_MIN_SCORE, 0.01,
-            help="가장 관련 높은 조항의 관련도가 이 값보다 낮으면, 답을 지어내지 않고 '규정에서 확인할 수 없음'으로 안내합니다.",
-        )
-
-    st.divider()
-    if st.session_state.history:
-        st.download_button(
-            "💾 대화 내용 저장", export_text(st.session_state.history, st.session_state.get("doc_name", "")),
-            file_name=f"규정도우미_대화_{datetime.now():%Y%m%d_%H%M}.txt",
-            mime="text/plain", use_container_width=True,
-        )
-    if st.button("🧹 대화 기록 지우기", use_container_width=True):
-        st.session_state.history = []
-        st.rerun()
+        st.caption("답변 출처의 '📚 전체 보기'를 누르면 여기로 이동해요.")
+        pick = st.selectbox("조항 선택", range(len(arts)), format_func=lambda i: arts[i][0],
+                            key="article_pick", label_visibility="collapsed")
+        label, page, body, _ = arts[pick]
+        st.caption(f"p.{page}")
+        with st.container(height=620):
+            st.text(body)
+    else:
+        st.caption("문서를 불러오면 조항 목록이 여기에 나타나요.")
 
 # --- 문서 불러오기: 업로드 우선, 없으면 기본 취업규칙.pdf 자동 로드 ---
 if ready:
@@ -742,9 +777,11 @@ if "chunks" in st.session_state and ready:
 
     moved_to = st.session_state.pop("goto_toast", None)
     if moved_to:
-        st.toast(f"📚 왼쪽 '조항 직접 보기'에서 {moved_to}을(를) 열었어요.")
+        st.toast(f"📚 왼쪽 '조항 보기'에서 {moved_to}을(를) 열었어요.")
 
     for n, turn in enumerate(st.session_state.history):
+        # '내 질문' 목록에서 이동해 올 위치 (상단 메뉴에 가리지 않게 여백)
+        st.markdown(f'<div id="q{n + 1}" style="scroll-margin-top:70px"></div>', unsafe_allow_html=True)
         with st.chat_message("user"):
             st.write(turn["q"])
         with st.chat_message("assistant"):
